@@ -1,10 +1,7 @@
 import sys
-import copy
 import json
 
 
-# common section
-# --------------
 class EventType:
     START = 's'
     END = 'e'
@@ -20,195 +17,197 @@ class AppState:
     PAUSED = 2
 
 
-def is_device_event(event):
-    return event['t'] in (EventType.CONNECT, EventType.DISCONNECT,)
+class TimeTracker:
+    def track(self, value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = None
 
-def is_connect_event(event):
-    return event['t'] == EventType.CONNECT
+        if not (isinstance(value, dict) and
+                all([i in value for i in ('events', 'ttl', 'currentTime',)])):
+            return {'error': 'Invalid input value. JSON or dict are allowed.'}
 
-def is_disconnect_event(event):
-    return event['t'] == EventType.DISCONNECT
+        events = self.flatten_event_stream(value['events'], value['ttl'],
+                                           value['currentTime'])
+        return self.reduce_events(events)
 
-def is_pause_event(event):
-    return event['t'] == EventType.PAUSE
+    # event checkers
+    def is_device_event(self, event):
+        return event['t'] in (EventType.CONNECT, EventType.DISCONNECT,)
 
-def is_unpause_event(event):
-    return event['t'] == EventType.UNPAUSE
+    def is_connect_event(self, event):
+        return event['t'] == EventType.CONNECT
 
-def is_start_event(event):
-    return event['t'] == EventType.START
+    def is_disconnect_event(self, event):
+        return event['t'] == EventType.DISCONNECT
 
-def is_end_event(event):
-    return event['t'] == EventType.END
+    def is_pause_event(self, event):
+        return event['t'] == EventType.PAUSE
 
+    def is_unpause_event(self, event):
+        return event['t'] == EventType.UNPAUSE
 
-# flatten section
-# ---------------
-def flattenEventStream(events, ttl, currentTime=None):
-    events = copy.copy(events)
-    events.sort(key=lambda x: x['c'])
+    def is_start_event(self, event):
+        return event['t'] == EventType.START
 
-    data = findDeviceStreams(events)
-    deviceStreams, otherEvents = data['deviceStreams'], data['otherEvents']
-    result = otherEvents
-    for deviceId, devices in deviceStreams.items():
-        result += flattenDeviceStream(devices, ttl, currentTime)
-    result.sort(key=lambda x: x['c'])
-    return result
+    def is_end_event(self, event):
+        return event['t'] == EventType.END
 
+    # flatten methods
+    def flatten_event_stream(self, events, ttl, current_time=None):
+        events = events[:]
+        events.sort(key=lambda x: x['c'])
 
-def findDeviceStreams(events):
-    deviceStreams = {}
-    otherEvents = []
-    paused = False
-    for event in events:
-        if is_device_event(event):
-            if event['d'] not in deviceStreams:
-                deviceStreams[event['d']] = []
-            deviceStreams[event['d']].append(event)
-        else:
-            ignore = False
-            if is_pause_event(event):
-                ignore = paused
-                paused = True
-            elif is_unpause_event(event):
-                ignore = not paused
-                paused = False
-            if not ignore:
-                otherEvents.append(event)
-            if is_end_event(event):
-                break
-    return {'deviceStreams': deviceStreams, 'otherEvents': otherEvents,}
+        device_streams, result = self.find_device_streams(events)
+        for devices in device_streams.values():
+            result += self.flatten_device_stream(devices, ttl, current_time)
+        result.sort(key=lambda x: x['c'])
+        return result
 
+    def find_device_streams(self, events):
+        device_streams, other_events = {}, []
 
-def flattenDeviceStream(events, ttl, currentTime=None):
-    if not events:
-        return []
+        paused = False
+        for event in events:
+            if self.is_device_event(event):
+                if event['d'] not in device_streams:
+                    device_streams[event['d']] = []
+                device_streams[event['d']].append(event)
+            else:
+                ignore = False
+                if self.is_pause_event(event):
+                    ignore = paused
+                    paused = True
+                elif self.is_unpause_event(event):
+                    ignore = not paused
+                    paused = False
+                if not ignore:
+                    other_events.append(event)
+                if self.is_end_event(event):
+                    break
 
-    lastEvent = events[0]
-    result = [lastEvent]
+        return device_streams, other_events
 
-    lastConnected = None
-    if is_connect_event(lastEvent):
-        lastConnected = lastEvent['c']
+    def flatten_device_stream(self, events, ttl, current_time=None):
+        if not events:
+            return []
 
-    for event in events:
-        if is_connect_event(event):
-            ignore = False
-            if is_connect_event(lastEvent):
-                if lastConnected is not None:
-                    if event['c'] - lastConnected < ttl:
+        last_event = events[0]
+        result = [last_event]
+
+        last_connected = None
+        if self.is_connect_event(last_event):
+            last_connected = last_event['c']
+
+        for event in events:
+            if self.is_connect_event(event):
+                ignore = False
+                if (self.is_connect_event(last_event) and
+                        last_connected is not None):
+                    if event['c'] - last_connected < ttl:
                         ignore = True
                     else:
                         result.append({
                             't': 'd',
-                            'c': lastConnected + ttl / 2,
+                            'c': last_connected + ttl / 2,
                             'u': event['u'],
                             'd': event['d']
                         })
-            if not ignore:
-                result.append(event)
+                if not ignore:
+                    result.append(event)
+                last_connected = event['c']
 
-            lastConnected = event['c']
+            elif self.is_disconnect_event(event):
+                if (self.is_connect_event(last_event) and
+                        last_connected is not None and
+                        event['c'] - last_connected >= ttl):
+                    result.append({
+                        't': 'd',
+                        'c': last_connected + ttl / 2,
+                        'u': event['u'],
+                        'd': event['d'],
+                    })
+                elif not self.is_disconnect_event(last_event):
+                    result.append(event)
 
-        elif is_disconnect_event(event):
+            last_event = result[-1]
 
-            if (is_connect_event(lastEvent) and lastConnected is not None and
-                    event['c'] - lastConnected >= ttl):
-                result.append({
-                    't': 'd',
-                    'c': lastConnected + ttl / 2,
-                    'u': event['u'],
-                    'd': event['d'],
-                })
-            elif not is_disconnect_event(lastEvent):
-                result.append(event)
-
-        lastEvent = result[-1]
-
-    if (is_connect_event(lastEvent) and lastConnected is not None and
-            currentTime is not None):
-        if currentTime - lastConnected >= ttl:
+        if (self.is_connect_event(last_event) and
+                last_connected is not None and current_time is not None and
+                current_time - last_connected >= ttl):
             result.append({
                 't': 'd',
-                'c': lastConnected + ttl / 2,
-                'u': lastEvent['u'],
-                'd': lastEvent['d'],
+                'c': last_connected + ttl / 2,
+                'u': last_event['u'],
+                'd': last_event['d'],
             })
 
-    return result
+        return result
+
+    # reduce methods
+    def is_both_connected(self, connected_devices):
+        return len(set(connected_devices.values())) > 1
+
+    def reduce_events(self, events):
+        tracked_time = 0
+        connected_devices = {}
+        last_both_connected = None
+        last_active = None
+        paused = False
+        state_time = None
+        for event in events:
+            if self.is_connect_event(event):
+                prev_connected = self.is_both_connected(connected_devices)
+                connected_devices[event['d']] = event['u']
+                if (not prev_connected and not paused and
+                        self.is_both_connected(connected_devices)):
+                    last_both_connected = event['c']
+                    last_active = event['c']
+            elif self.is_disconnect_event(event):
+                prev_connected = self.is_both_connected(connected_devices)
+                connected_devices.pop(event['d'])
+                if (prev_connected and
+                        last_both_connected is not None and not paused and
+                        not self.is_both_connected(connected_devices)):
+                    tracked_time += event['c'] - last_both_connected
+                    last_both_connected = None
+            elif self.is_pause_event(event):
+                if last_both_connected is not None and not paused:
+                    tracked_time += event['c'] - last_both_connected
+                    last_both_connected = None
+                paused = True
+            elif self.is_unpause_event(event):
+                if self.is_both_connected(connected_devices):
+                    last_both_connected = event['c']
+                    last_active = event['c']
+                paused = False
+            elif self.is_end_event(event):
+                if last_both_connected is not None and not paused:
+                    tracked_time += event['c'] - last_both_connected
+                    last_both_connected = None
+                break
+
+            state_time = event['c']
+
+        state = AppState.IDLE
+        if paused:
+            state = AppState.PAUSED
+        elif self.is_both_connected(connected_devices):
+            state = AppState.IN_PROGRESS
+
+        return {
+            'trackedTime': tracked_time,
+            'lastActive': last_active,
+            'stateTime': state_time,
+            'state': state,
+        }
 
 
-# reduce section
-# --------------
-def connected(connectedDevices):
-    firstUserId = None
-    for deviceId, userId in connectedDevices.items():
-        if firstUserId is None:
-            firstUserId = userId
-        elif not firstUserId == userId:
-            return True
-    return False
-
-
-def reduceEvents(events):
-    trackedTime = 0
-    connectedDevices= {}
-    lastBothConnected = None
-    lastActive = None
-    paused = False
-    stateTime = None
-    for event in events:
-        if is_connect_event(event):
-            prevConnected = connected(connectedDevices)
-            connectedDevices[event['d']] = event['u']
-            if not prevConnected and connected(connectedDevices) and not paused:
-                lastBothConnected = event['c']
-                lastActive = event['c']
-        elif is_disconnect_event(event):
-            prevConnected = connected(connectedDevices)
-            connectedDevices.pop(event['d'])
-            if (prevConnected and lastBothConnected is not None and
-                    not connected(connectedDevices) and not paused):
-                trackedTime += event['c'] - lastBothConnected
-                lastBothConnected = None
-        elif is_pause_event(event):
-            if lastBothConnected is not None and not paused:
-                trackedTime += event['c'] - lastBothConnected
-                lastBothConnected = None
-            paused = True
-        elif is_unpause_event(event):
-            if connected(connectedDevices):
-                lastBothConnected = event['c']
-                lastActive = event['c']
-            paused = False
-        elif is_end_event(event):
-            if lastBothConnected is not None and not paused:
-                trackedTime += event['c'] - lastBothConnected
-                lastBothConnected = None
-            break
-
-        stateTime = event['c']
-
-    state = AppState.IDLE
-    if paused:
-        state = AppState.PAUSED
-    elif connected(connectedDevices):
-        state = AppState.IN_PROGRESS
-
-    return {
-        'trackedTime': trackedTime,
-        'lastActive': lastActive,
-        'stateTime': stateTime,
-        'state': state,
-    }
-
-
-if __name__ == "__main__":
-    data = json.loads(sys.stdin.read())
-    events = flattenEventStream(data['events'],
-                                data['ttl'], data['currentTime'])
-    result = reduceEvents(events)
-    data = json.dumps(result)
-
-    sys.stdout.write(data)
+if __name__ == '__main__':
+    if sys.stdin.isatty():
+        data = {'error': 'Input stream is unavailable.'}
+    else:
+        data = TimeTracker().track(sys.stdin.read())
+    sys.stdout.write(json.dumps(data))
